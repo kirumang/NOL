@@ -1,466 +1,328 @@
 import sys,os
+sys.path.append(os.path.abspath('.'))  
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
+import transforms3d as tf3d
+import matplotlib.pyplot as plt
+import time
+import random
 import numpy as np
-import scipy.ndimage
+
 import tensorflow as tf
-import keras
-from keras import backend as K
-    
-from keras.models import Model
-from keras.layers import Input,Conv2D,MaxPooling2D,UpSampling2D,Conv2DTranspose,ZeroPadding2D,GlobalMaxPooling2D
-from keras.layers import Flatten,Dense,Dropout,Activation,RepeatVector,Lambda,Reshape,Subtract
-from keras.layers import Concatenate
-from keras.layers import Layer,TimeDistributed,Bidirectional
-from keras.layers import merge,ConvLSTM2D
-from keras.layers.normalization import BatchNormalization
-from keras.layers.advanced_activations import LeakyReLU
-from keras.regularizers import l2,Regularizer
-from keras import losses
-from keras import optimizers
-from keras.callbacks import TensorBoard, ModelCheckpoint
+gpus = tf.config.experimental.list_physical_devices('GPU')
+tf.config.experimental.set_memory_growth(gpus[0], True)
+from tensorflow.python.framework.ops import disable_eager_execution
+disable_eager_execution()
+
+from tensorflow import keras
+from tensorflow.keras import backend as K
 import tensorflow_graphics as tfg
-from tensorflow_graphics.geometry import transformation as tf_tf
+from tensorflow.keras.applications.densenet import preprocess_input
+
+
+from NOL_model import NOL_network as NOLnet
+from NOL_model.NOL_network import simple_mask_error,iou_error,so3_to_mat
+import NOL_tools.operations as to
+#Rendering process 
+import subprocess
+import cv2
+import NOL_tools.train_io as tio
+from NOL_tools.train_io import data_generator
+
+
 
 import math
-from keras.applications.densenet import DenseNet121
-ROOT_DIR = os.path.abspath("../")
-sys.path.append(ROOT_DIR)
-from model.diff_renderer import proj_to_tex_layer,proj_to_tex_layer_rnn,\
-                                neural_rendering_raster_and_texture,\
-                                neural_rendering_raster_lighting,\
-                                neural_rendering_crop_resize,\
-                                neural_rendering_gbuffer
+from math import radians
+from skimage.transform import resize
+from skimage.morphology import binary_dilation
+import h5py
+import json
 
-from matplotlib import pyplot as plt
-import model.tf_addon as tfa
 
-class resize_uv_mask(Layer):     
-    def __init__(self,mask=False,**kwargs):
-        self.mask = mask
-        super(resize_uv_mask,self).__init__(**kwargs)
-    def build(self,input_shape):
-        super(resize_uv_mask,self).build(input_shape)
-    def call(self,x):
-        img = x[0]
-        ref_size = x[1]        
-        if(self.mask):
-            return tf.cast(tf.greater(tf.compat.v1.image.resize_bilinear(img,[tf.shape(ref_size)[1],tf.shape(ref_size)[2]]),0.5),tf.float32)
-        else:
-            return tf.compat.v1.image.resize_bilinear(img,[tf.shape(ref_size)[1],tf.shape(ref_size)[2]])            
-    def compute_output_shape(self,input_shape):        
-        return (tuple([input_shape[0][0],input_shape[1][1],input_shape[1][2],input_shape[0][3]]))
+class NOL:
+    def __init__(self,src_fn,im_h,im_w,cam_K,n_source=6):       
+        train_model,backbone,render_gan,Tuning_pose =\
+        NOLnet.neural_obj_learning(render_im_w=im_w,render_im_h=im_h,target_im_w=256,target_im_h=256,
+                                   cam_K=cam_K)
 
-class smooth_label_loss2(Layer):
-    def __init__(self,**kwargs):
-        super(smooth_label_loss2,self).__init__(**kwargs)
-    def build(self,input_shape):
-        super(smooth_label_loss2,self).build(input_shape)
-    def call(self,x):
+        for layer in backbone.layers:
+            layer.trainable=False  
+        weight_fn ="./weights/nol_weights.hdf5"
+        train_model.load_weights(weight_fn)
+        print("Loading trained model from ",weight_fn)
+        for layer in backbone.layers:
+            layer.trainable=True
+
+        gradient = K.gradients(Tuning_pose.outputs[0], [Tuning_pose.inputs[4],Tuning_pose.inputs[2]])
+        iterate = keras.backend.function(Tuning_pose.inputs, [gradient,Tuning_pose.outputs[0],Tuning_pose.output[3]])
+
+        simple_renderer = NOLnet.simple_render(img_h=im_h,img_w=im_w,cam_K=cam_K) 
+
+
+        self.iterate = iterate
+        self.render_gan = render_gan
+        self.simple_renderer = simple_renderer      
+        self.im_height=im_h
+        self.im_width=im_w
+        self.cam_K=cam_K          
+        self.t_images,self.t_vert,self.t_faces,self.t_poses,self.t_bboxes,\
+        self.t_bboxes_ori,self.gt_masks_full,self.gt_masks=self.load_data(src_fn)
+        
+        self.n_src = self.t_images.shape[0]        
+        
+        self.t_vert_vis=np.zeros((1000),bool)        
+        
+        self.t_face_angles=[]
+        self.face_angles_full=[]        
+        self.face_o3d = []        
+        self.n_source = n_source
+        print("Compute visible vertices in each poses...")
+        self.update_vert_vis()
+    
+    def get_edge_imgage(self,img_source,render_xyz,c_box,th=0.1):
+        render_xyz = render_xyz[c_box[0]:c_box[2],c_box[1]:c_box[3]]
+        mask = render_xyz[:,:,2]>0
+        dist_x,dist_y = np.gradient(render_xyz[:,:,2])
+        depth_edge = np.logical_or(np.abs(dist_x)>th,np.abs(dist_y)>th)
+        edge_mask = depth_edge
+        edge_mask = resize(edge_mask.astype(np.float32),(256,256))>0
+        edge_mask = binary_dilation(edge_mask)>0
+        img_source[edge_mask>0]=[0,1,1]
+        return img_source
+    def display_inputs(self):
+        f,ax = plt.subplots(1,self.n_src,figsize=(10,20))
+        for fig_id in range(0,self.n_src):      
+            simple_xyz = self.simple_renderer.predict([np.array([self.t_vert]),np.array([self.t_faces]),self.t_poses[fig_id:fig_id+1]])
+            c_box = self.t_bboxes_ori[fig_id]
+            render_xyz = simple_xyz[0][:,:,1:4] 
+            img_source = np.copy(self.t_images[fig_id])
+            if not(c_box[2]-c_box[0]<10 or c_box[3]-c_box[1]<10):
+                img_source = self.get_edge_imgage(img_source,render_xyz,c_box,th=0.1)
+            ax[fig_id].imshow(img_source)
+    def get_updates(self,dx, x,v,iterations,momentum=0.9,lr=0.001,decay=0.99):
         '''
-        Concept:okay, whatever label selected, keep close as possible with surrounding pixels
-        1. Only Feature values 4: (0,1,2:color, 3:angles)
-        2. 1st order gradient of feature values  #[l_scored_mask,rendered_mask,selected_cands])
-        '''        
-        #x vs x neighbors 
-        #cond1: labels for surrounding pixel are diffrent 
-        #cond2: minimize their feature difference (Gradient)
-        soft_mask = x[0][:,:,:,:,0]  #[Pose X Batch X H X W x (1)]
-        rendered_mask = x[1][:,:,:,:,0] #[Pose X batch x H X W x (1)]
-        feature_raw = x[2] #PosexHxWx(C)        
-        mask_as_feature = tf.transpose(soft_mask,[0,2,3,1]) #Pose X H X W x Batch -> soft_mask
-        mask_per_img = tf.transpose(rendered_mask,[0,2,3,1])#Pose X H X W x Batch -> mask
-        mask_per_pose = tf.cast(tf.greater(tf.reduce_sum(mask_per_img,axis=[3],keepdims=True),0),tf.float32)     
-        #PoseXHxWx1
+        grad:gradient
+        params: input variable
+        v = mu * v - learning_rate * dx # integrate velocity
+        x += v # integrate position
+        '''    
+        if decay > 0:
+            lr = lr *(decay**iterations) # (1. / (1. +decay ** iterations))
+        v = momentum*v - lr*dx
+        x += v
+        return x,v
+    def load_data(self,fn):        
+        train_data = h5py.File(fn, "r")
+        t_vert = np.array(train_data["vertices_3d"])
+        t_faces =  np.array(train_data['faces'])
         
-        #gradient
-        grad_v = mask_per_pose[:,:-1,:,:]*feature_raw[:,:-1,:,:]-mask_per_pose[:,1:,:,:]*feature_raw[:,1:,:,:] #Pose x H-1 x W x C
-        grad_u = mask_per_pose[:,:,:-1,:]*feature_raw[:,:,:-1,:]-mask_per_pose[:,:,1:,:]*feature_raw[:,:,1:,:] #Pose x H x W-1 x C        
-        #Difference of gradient
+        t_images =  np.array(train_data['images'])
+        t_poses = np.array(train_data['poses'])
+        t_masks = np.array(train_data['masks'])        
+        t_bboxes = np.array(train_data['bboxes']).astype(np.float32)
+        t_bboxes_ori = np.copy(t_bboxes)
+        t_bboxes[:,0]=t_bboxes[:,0]/(self.im_height-1)
+        t_bboxes[:,1]=t_bboxes[:,1]/(self.im_width-1)
+        t_bboxes[:,2]=(t_bboxes[:,2]-1)/(self.im_height-1)
+        t_bboxes[:,3]=(t_bboxes[:,3]-1)/(self.im_width-1)
+        t_bboxes = np.clip(t_bboxes,0,1)        
+
+        gt_masks_full=[]
+        gt_masks=[]
+        t_bboxes_ori = t_bboxes_ori.astype(np.int)
+        for im_id in range(t_images.shape[0]):
+            mask = resize(t_masks[im_id].astype(np.float32),(t_bboxes_ori[im_id,2]-t_bboxes_ori[im_id,0],t_bboxes_ori[im_id,3]-t_bboxes_ori[im_id,1]))
+            mask[mask>=0.5] = 1
+            mask[mask<0.5] = 0
+            full_mask = np.zeros((480,640,1))
+            crop_mask = np.zeros((256,256,1))
+            crop_mask[:,:,0:1]= t_masks[im_id]>0
+            full_mask[t_bboxes_ori[im_id,0]:t_bboxes_ori[im_id,2],t_bboxes_ori[im_id,1]:t_bboxes_ori[im_id,3],0:1]=mask
+            gt_masks_full.append(full_mask)
+            gt_masks.append(crop_mask)    
+        gt_masks_full = np.array(gt_masks_full)
+        gt_masks = np.array(gt_masks)                
+        train_data.close()
+        return t_images,t_vert,t_faces,t_poses,t_bboxes,\
+               t_bboxes_ori,gt_masks_full,gt_masks
         
-        diff_v_grad_v = tf.abs(mask_per_pose[:,:-2,:,:]*grad_v[:,:-1,:,:]-mask_per_pose[:,:-2,:,:]*grad_v[:,1:,:,:])#Pose x H-2 x W x C
-        diff_u_grad_v =  tf.abs(mask_per_pose[:,:-1,:-1,:]*grad_v[:,:,:-1,:]-mask_per_pose[:,:-1,:-1,:]*grad_v[:,:,1:,:])#Pose x H-1 x W-1 x C        
-        diff_v_grad_u =  tf.abs(mask_per_pose[:,:-1,:-1,:]*grad_u[:,:-1,:,:]-mask_per_pose[:,:-1,:-1,:]*grad_u[:,1:,:,:]) #Pose x H-1 x W-1 x C
-        diff_u_grad_u =  tf.abs(mask_per_pose[:,:,:-2,:]*grad_u[:,:,:-1,:]-mask_per_pose[:,:,:-2,:]*grad_u[:,:,1:,:]) #Pose x H x W-2 x C 
+    def update_vert_vis(self):
+        c_vert = np.array(self.t_vert)
+        face_obj = np.array(self.t_faces)
+        #t_face_angles
+        face_angles=[]
+        face_angles_full=[]
+        vert_visb=[]
+        for im_id in range(self.n_src):
+            pose = self.t_poses[im_id]
+            vert_vis = np.ones((c_vert.shape[0]))    
+            tf_vert = (np.matmul(pose[:3,:3],c_vert.T)+pose[:3,3:4])
+            mesh_vert = np.copy(tf_vert.T)    
+            mesh_normal = to.compute_face_normals(mesh_vert,face_obj)    
+            bbox_new = self.t_bboxes_ori[im_id]
+            
+            simple_xyz = self.simple_renderer.predict([np.array([c_vert]),np.array([face_obj]),np.array([pose])])
+            render_xyz = simple_xyz[0][:,:,1:4] 
+            depth_r = render_xyz[:,:,2]
+            xyz = to.getXYZ(depth_r,self.cam_K[0,0],self.cam_K[1,1],self.cam_K[0,2],self.cam_K[1,2])
+            normal2,_ = to.get_normal(render_xyz[:,:,2],self.cam_K[0,0],self.cam_K[1,1],self.cam_K[0,2],self.cam_K[1,2])
+            mask_effect = depth_r>0 #gt_masks_full[im_id,:,:,0]>0
+            mask = depth_r>0
+            normal2[np.invert(mask_effect)]=0
+            camera_angle = np.copy(xyz)
+            face_angle2= np.zeros( (self.im_height,self.im_width))
+            valid_xyz = np.linalg.norm(camera_angle,axis=2)
+            valid_normal = np.linalg.norm(normal2,axis=2)
+            mask_face = np.logical_and(np.logical_and(depth_r>0,valid_xyz>0),valid_normal>0)
+            face_angle2[mask_face] = np.sum(camera_angle[mask_face]*normal2[mask_face],axis=1)\
+                                            /valid_xyz[mask_face]/valid_normal[mask_face]
+
+            valid_indice = np.zeros((mesh_vert.shape[0]),bool)
+            u_temp  =(self.cam_K[0,0]*tf_vert[0]/tf_vert[2] + self.cam_K[0,2]).astype(np.int)
+            v_temp  =(self.cam_K[1,1]*tf_vert[1]/tf_vert[2] + self.cam_K[1,2]).astype(np.int)
+            valid_idx = np.logical_and(u_temp>=0, u_temp+1<self.im_width)
+            valid_idx = np.logical_and(np.logical_and(v_temp>=0, v_temp+1<self.im_height),valid_idx)    
+            
+            valid_indice[valid_idx] = np.abs(depth_r[v_temp[valid_idx],u_temp[valid_idx]]-tf_vert[2,valid_idx])<0.01
+            valid_indice[valid_idx] = np.abs(depth_r[v_temp[valid_idx]+1,u_temp[valid_idx]]-tf_vert[2,valid_idx])<0.01
+            valid_indice[valid_idx] = np.abs(depth_r[v_temp[valid_idx],u_temp[valid_idx]+1]-tf_vert[2,valid_idx])<0.01
+            valid_indice[valid_idx] = np.abs(depth_r[v_temp[valid_idx]+1,u_temp[valid_idx]+1]-tf_vert[2,valid_idx])<0.01
+            
+            valid_uvs = np.zeros_like(valid_indice)
+            
+            #valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],1 - self.gt_masks_full[im_id][v_temp[valid_idx],u_temp[valid_idx],1])
+            #valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],1 - self.gt_masks_full[im_id][v_temp[valid_idx]+1,u_temp[valid_idx],1])
+            #valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],1 - self.gt_masks_full[im_id][v_temp[valid_idx],u_temp[valid_idx]+1,1])
+            #valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],1 - self.gt_masks_full[im_id][v_temp[valid_idx]+1,u_temp[valid_idx]+1,1])   
+            
+            
+            valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx],u_temp[valid_idx],0])
+            valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx]+1,u_temp[valid_idx],0])
+            valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx],u_temp[valid_idx]+1,0])
+            valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx]+1,u_temp[valid_idx]+1,0])
+            valid_indice[valid_idx] = np.logical_and(valid_indice[valid_idx],valid_uvs[valid_idx])   
+            
+            #remove invalid faces
+            visible_face_id = (valid_indice[face_obj[:,0]]+valid_indice[face_obj[:,1]]+valid_indice[face_obj[:,2]])>0                            
+            invalid_normal_face_id = face_obj[np.logical_and(mesh_normal[:,2]>0,
+                                                             np.invert(visible_face_id))]
+            valid_indice[invalid_normal_face_id[:,0]]=0
+            valid_indice[invalid_normal_face_id[:,1]]=0
+            valid_indice[invalid_normal_face_id[:,2]]=0            
         
-        loss1 = tf.reduce_sum(diff_v_grad_v,axis=[1,2,3])/(tf.reduce_sum(mask_per_pose[:,:-2,:,:])+1E-6)/tf.cast(tf.shape(feature_raw)[3],tf.float32)
-        loss2 = tf.reduce_sum(diff_u_grad_v,axis=[1,2,3])/(tf.reduce_sum(mask_per_pose[:,:-1,:-1,:])+1E-6)/tf.cast(tf.shape(feature_raw)[3],tf.float32)
-        loss3 = tf.reduce_sum(diff_v_grad_u,axis=[1,2,3])/(tf.reduce_sum(mask_per_pose[:,:-1,:-1,:])+1E-6)/tf.cast(tf.shape(feature_raw)[3],tf.float32)
-        loss4 = tf.reduce_sum(diff_u_grad_u,axis=[1,2,3])/(tf.reduce_sum(mask_per_pose[:,:,:-2,:])+1E-6)/tf.cast(tf.shape(feature_raw)[3],tf.float32)
-        loss = tf.reduce_mean((loss1+loss2+loss3+loss4)/4,keepdims=True)
+            vert_visb.append(valid_indice)
+            face_angles_full.append(face_angle2)
+            face_angle_crop = resize(face_angle2[bbox_new[0]:bbox_new[2],bbox_new[1]:bbox_new[3]],(256,256))
+            face_angles.append(face_angle_crop)
+        self.t_vert_vis = np.array(vert_visb)
+        self.t_face_angles  = np.array(face_angles)
+        self.face_angles_full  = face_angles_full
+        print("[Updated] Number of visible vertices:",np.sum(self.t_vert_vis,axis=1))                
+    
+    def get_batches(self,im_id,target_pose=np.array([0]),integrated=True):
+        if(im_id==-1):
+            target_pose = target_pose          
+            pts = (np.matmul(target_pose[:3,:3],self.t_vert.T)+target_pose[:3,3:4]).T
+            proj_u = self.cam_K[0,0]*pts[:,0]/pts[:,2]+self.cam_K[0,2]
+            proj_v = self.cam_K[1,1]*pts[:,1]/pts[:,2]+self.cam_K[1,2]
+            ct_u = int((np.max(proj_u)+np.min(proj_u))/2)
+            ct_v = int((np.max(proj_v)+np.min(proj_v))/2)        
+            bbox_ori = np.array([ct_v-128,ct_u-128,ct_v+128,ct_u+128])    
+            bbox_ori[:2]=np.maximum(0,bbox_ori[:2])
+            bbox_ori[2]=min(bbox_ori[2],self.im_height-1)
+            bbox_ori[3]=min(bbox_ori[3],self.im_width-1)
+        else:
+            target_pose = self.t_poses[im_id]
+            bbox_ori = self.t_bboxes_ori[im_id]
         
-        return tf.tile(loss,[tf.shape(x[1])[1]])
+        t_masks =np.zeros((self.n_src,256,256,1))
+        b_img,b_ang_in,b_vert3d,b_faces,\
+        b_pose_input,b_vert_visible,b_bbox_train,\
+        b_poses,b_bboxes,b_img_gt,uv_target,face_target,img_ids,\
+        obj_3d\
+        = to.get_tuning_set(target_pose,self.t_images,self.t_poses,self.t_bboxes,self.t_vert,self.t_faces,
+                         self.simple_renderer,self.t_vert_vis,self.n_source,self.t_bboxes_ori,t_masks,self.t_face_angles,
+                         cam_K=self.cam_K,res_x=self.im_width,res_y=self.im_height,bbox_ori=bbox_ori)
+        if not(integrated):
+            return b_img,b_ang_in,b_vert3d,b_faces,b_pose_input,\
+                   b_vert_visible,b_bbox_train,b_poses,b_bboxes, \
+                   self.gt_masks[np.array(img_ids).astype(int)],img_ids
         
-    def compute_output_shape(self,input_shape):
-        return (tuple([input_shape[1][1]]))
-
-
-class preprocess_img_layer(Layer):
-    def __init__(self,**kwargs):
-        self.mean = np.array([0.485, 0.456, 0.406])
-        self.std = np.array([0.229, 0.224, 0.225])
-        super(preprocess_img_layer,self).__init__(**kwargs)
-    def build(self,input_shape):
-        super(preprocess_img_layer,self).build(input_shape)
-    def call(self,x):        
-        ch1=(x[:,:,:,:1]-self.mean[0])/self.std[0]
-        ch2=(x[:,:,:,1:2]-self.mean[1])/self.std[1]
-        ch3=(x[:,:,:,2:3]-self.mean[2])/self.std[2]
-        out = tf.concat([ch1,ch2,ch3],axis=-1)
-        return out
-    def compute_output_shape(self,input_shape):
-        return input_shape
-    
-class perceptual_loss(Layer):
-    def __init__(self,**kwargs):        
-        super(perceptual_loss,self).__init__(**kwargs)
-    def build(self,input_shape):
-        super(perceptual_loss,self).build(input_shape)
-    def call(self,x):
-        f1_r= x[2]
-        f2_r= x[3]        
-        f1_i= x[0][:tf.shape(f1_r)[0],:,:,:]
-        f2_i= x[1][:tf.shape(f1_r)[0],:,:,:]        
-        mask_1= x[4]
-        mask_2= x[5]        
-        ch_1= tf.cast(tf.shape(f1_i)[3],tf.float32)
-        ch_2= tf.cast(tf.shape(f2_i)[3],tf.float32)        
-        layer1 = tf.reduce_sum(mask_1*tf.square(f1_i-f1_r),axis=[1,2,3])/ (tf.reduce_sum(mask_1,axis=[1,2,3])*ch_1+0.001)
-        layer2 = tf.reduce_sum(mask_2*tf.square(f2_i-f2_r),axis=[1,2,3])/ (tf.reduce_sum(mask_2,axis=[1,2,3])*ch_2+0.001)
-        loss_per_pose = (layer1+layer2)/ 2 #+layer3+layer4)/4 #n_posex1
-        loss_single = tf.reduce_mean(loss_per_pose,keepdims=True) #[1,1]        
-        return tf.tile(loss_single,[tf.shape(x[0])[0]])
-    def compute_output_shape(self,input_shape):
-        return (tuple([input_shape[0][0]]))
-
-class recont_loss(Layer):
-    def __init__(self,**kwargs):
-        super(recont_loss,self).__init__(**kwargs)
-    def build(self,input_shape):
-        super(recont_loss,self).build(input_shape)
-    def call(self,x):
-        visible = x[0]
-        y_pred=x[1]
-        y_gt=x[2][:tf.shape(y_pred)[0],:,:,:]                 
-        visible = tf.cast(tf.greater(visible,0),y_pred.dtype)
-        diff = tf.abs(y_gt-y_pred)
-        loss_visible = visible*diff                
-        loss = tf.reduce_sum(loss_visible,axis=[1,2,3])/(tf.reduce_sum(visible*3,axis=[1,2,3])+0.001)
-        loss_single = tf.reduce_mean(loss,keepdims=True) #[1,1]                
-        return tf.tile(loss_single,[tf.shape(x[2])[0]])
-
-    def compute_output_shape(self,input_shape):
-        return (tuple([input_shape[2][0]]))
-
-from model import wdsr
-
-
-def map_vert_to_uv(cam_K):
-    '''
-    Derive projected UV map per image
-    '''
-    vert_xyz = Input(shape=(None,3))
-    pose_train = Input(shape=(4,4)) #trans + quat (x,y,z, qx,qy,qz,qw])
-    #pose_train = pose_vector_to_mat()(pose_vector) #batchx4x4
-    vert_visible = Input(shape=(None,1))
-    bbox = Input(shape=(4,)) #necessary to shift UV map to the given image space
-    #transfrom vert_xyz using the given pose
-    vert_tf = Lambda(lambda x: tf.transpose(tf.matmul( x[1][:,:3,:3],tf.transpose(x[0],[0,2,1]))+ x[1][:,:3,3:],[0,2,1]))\
-              ([vert_xyz,pose_train])    
-    #batch x N x 1
-    u_temp = Lambda(lambda x:cam_K[0,0]*x[0][:,:,0]/(x[0][:,:,2])+cam_K[0,2]-x[1][:,1:2] )  ([vert_tf,bbox])
-    v_temp = Lambda(lambda x:cam_K[1,1]*x[0][:,:,1]/(x[0][:,:,2])+cam_K[1,2]-x[1][:,0:1] )  ([vert_tf,bbox]) #v_min,u_min,v_max,u_max
-    #batchx N x 1
-    #batchx 1
-     # (0) Invalid argument: Incompatible shapes: [15,8300,1] vs. [15,8300]
-    u_temp = Lambda(lambda x: x[2]*  tf.expand_dims(x[0]/(x[1][:,3:4]-x[1][:,1:2]),axis=2)       )   ([u_temp,bbox,vert_visible])
-    v_temp = Lambda(lambda x: x[2]*  tf.expand_dims(x[0]/(x[1][:,2:3]-x[1][:,0:1]),axis=2)      )([v_temp,bbox,vert_visible])
-    #shift to the bbox and normalize
-    #batchxNx1 + batchxNx1
-    vert_uv = Concatenate()([u_temp,v_temp])    #if bbox is not 256 -> it is resized
-    return Model(inputs=[vert_xyz,pose_train,vert_visible,bbox],outputs=[vert_uv])
-
-def DCGAN_discriminator():
-    nb_filters = 32
-    nb_conv = int(np.floor(np.log(256) / np.log(2)))
-    list_filters = [nb_filters * min(8, (2 ** i)) for i in range(nb_conv)]
-
-    input_img = Input(shape=(256, 256, 3))
-    x = Conv2D(list_filters[0], (3, 3), strides=(2, 2), name="disc_conv2d_1", padding="same")(input_img)
-    x = BatchNormalization(axis=-1)(x)
-    x = LeakyReLU(0.2)(x)
-    # Next convs
-    for i, f in enumerate(list_filters[1:]):
-        name = "disc_conv2d_%s" % (i + 2)
-        x = Conv2D(f, (3, 3), strides=(2, 2), name=name, padding="same")(x)
-        x = BatchNormalization(axis=-1)(x)
-        x = LeakyReLU(0.2)(x)
-
-    x_flat = Flatten()(x)
-    x_out = Dense(1, activation="sigmoid", name="disc_dense")(x_flat)
-    discriminator_model = Model(inputs=input_img, outputs=[x_out])
-    return discriminator_model
-
-class gan_loss(Layer):
-    def __init__(self,**kwargs):
-        super(gan_loss,self).__init__(**kwargs)
-    def build(self,input_shape):
-        super(gan_loss,self).build(input_shape)
-    def call(self,x):
-        y_pred = x[0] #posex1
-        y_true=x[1][:tf.shape(y_pred)[0]]   #batchx1
-        loss = tf.compat.v1.keras.losses.binary_crossentropy(y_true,y_pred)
-        loss_single = tf.reduce_mean(loss,keepdims=True)
-        return tf.tile(loss_single,[tf.shape(x[1])[0]])
-
-    def compute_output_shape(self,input_shape):
-        return (tuple([input_shape[1][0]]))
-
-def Render_and_integrate(ch_dim,ch_int=16,render_im_h=480,render_im_w=640,cam_K=np.eye(3),
-                          target_im_w=256,target_im_h=256 ):
-    texture_feature = Input(shape=(None,None,ch_dim))    
-    vert_xyz = Input(shape=(None,3))
-    vert_uv = Input(shape=(None,2))
-    faces = Input(shape=(None,3))
-    poses= Input(shape=(None,4,4))
-    bboxes = Input(shape=(None,4))
-    rendered = neural_rendering_crop_resize(img_h=render_im_h, img_w=render_im_w ,
-                                            target_w=target_im_w,target_h = target_im_h,
-                                            cam_K=cam_K,name="rendering",ch_dim=ch_dim)\
-                                ([vert_xyz,vert_uv,faces,texture_feature,poses,bboxes])
-    
-    #rendered: pose X render from each image x H x W x ch(mask+channels)
-    rendered_mask,rendered_feat = Lambda(lambda x : tf.split(x,[1,ch_dim],axis=4))(rendered)
-    #rendered_mask: pose X render from each image x H x W x 1(mask)
-    #rendered_feat: pose X render from each image x H x W x ch(channels)
-    mask_0= Lambda(lambda x :tf.cast( tf.greater(tf.reduce_sum(x,axis=1),0),tf.float32))(rendered_mask)#pose x H x W x 1       
-    rendered_raw = Lambda(lambda x : tf.transpose(x,[1,0,2,3,4]))(rendered_feat) #batch,pose, h x w x ch
-    rendered_raw = Lambda(lambda x : x[:,:,:,:,:3])(rendered_raw)
-    return Model(inputs=[vert_xyz,vert_uv,faces,texture_feature,poses,bboxes],outputs=[rendered_mask,rendered_feat,rendered_raw,mask_0])
-
-def integrated_img(ch_dim):
-    #Compute intergrate features (currently 5D tensor)
-    rendered_feat = Input(shape=(None,None,None,ch_dim))    
-    #accumulate renderings from different poses.
-    lstm1 = ConvLSTM2D(32,kernel_size = (3, 3),padding='same',return_sequences = True)(rendered_feat)
-    lstm1 = ConvLSTM2D(32,kernel_size = (3, 3),padding='same',return_sequences = True)(lstm1)
-    lstm_result = ConvLSTM2D(16,kernel_size = (3, 3),padding='same')(lstm1) #pose x H x W x 16
-    
-    lstm_feature = Lambda(lambda x : tf.tile(tf.expand_dims(x[0],axis=1),
-                                            [1,tf.shape(x[1])[1],1,1,1]))\
-                                            ([lstm_result,rendered_feat])
-    compare_featues = Concatenate()([rendered_feat,lstm_feature]) #[Pose X Batch X H X W x 31] 
-    
-    return Model(inputs=[rendered_feat],outputs=[compare_featues])
-
-def score_module(ch_dim,ch_int):
-        compare_featues = Input(shape=(None,None,None,ch_dim+ch_int))            
-        rendered_feat = Input(shape=(None,None,None,None))            
+        img_recont_norm,int_error,mask_output,proj_output,score_output,feature_in,uv_projection\
+        = self.render_gan.predict([b_img,b_ang_in,b_vert3d,b_faces,
+                              b_pose_input,b_vert_visible,b_bbox_train,
+                              b_poses,b_bboxes])  
+        proj_in = np.transpose(proj_output,[1,0,2,3,4]) #pose,batchxHxWxch
+        score_output = np.transpose(score_output,[1,0,2,3,4]) #posexbatchxhxwx1
+        img_sum = np.sum(score_output*proj_in,axis=1)
+        init_img = tio.get_original_image(np.copy(img_sum[0,:,:,:3]))   
+                
+        mask_render = np.sum(mask_output[:,0,:,:,:1],axis=0,keepdims=True)>0
+        f_gt_mask = self.gt_masks[np.array(img_ids).astype(int)]
+        f_gt_masks = np.concatenate([mask_render,f_gt_mask],axis=0)        
         
-        l_score = TimeDistributed( Conv2D(32, (3, 3), name='score_conv1',padding='same',activation='relu'))(compare_featues) 
-        l_score = TimeDistributed( Conv2D(16, (3, 3), name='score_conv2',padding='same',activation='relu'))(l_score) 
-        l_score = TimeDistributed( Conv2D(8, (3, 3), name='score_conv3',padding='same',activation='relu'))(l_score) 
-        l_score = TimeDistributed( Conv2D(1, (3, 3), name='score_conv5',padding='same')) (l_score) 
-        l_scored_mask = Lambda(lambda x:tf.keras.activations.softmax(x,axis=1))(l_score)   
-        selected_cands = Lambda(lambda x:tf.reduce_sum(x[0]*x[1],axis=1))([rendered_feat,l_scored_mask]) #01.24
-        return Model(inputs=[compare_featues,rendered_feat],outputs=[selected_cands,l_scored_mask])
-   
-
-class inter_projection_error(Layer):
-        def __init__(self,**kwargs):
-            super(inter_projection_error,self).__init__(**kwargs)
-        def build(self,input_shape):
-            super(inter_projection_error,self).build(input_shape)
-        def call(self,x):
-            r_mask = x[0] # proj(ref_imgs) x1 x H x W x 1 
-            r_proj = x[1]  #proj(ref_imgs) x 1x  x H x W x ch
-            shared_mask = r_mask[0] * r_mask[1:]  #img-1 x1 x H x W x1
-            proj_diff = r_proj[0] - r_proj[1:] #img-1 x1 x H x W x ch
-
-            diff_on_shared_mask = tf.reduce_sum(tf.abs(shared_mask*proj_diff),axis=[1,2,3,4]) /\
-                                 (tf.reduce_sum(shared_mask,axis=[1,2,3,4])+0.00001) #img-1
-
-            return tf.concat([tf.reduce_sum(diff_on_shared_mask,axis=0,keepdims=True),diff_on_shared_mask],axis=0)
-        def compute_output_shape(self,input_shape):
-            return (tuple([input_shape[0][0]]))
-
-
-def nol_softmax(cam_K,render_im_w = 640,render_im_h = 480,
-                       target_im_w=-1,target_im_h=-1):
-    input_img = Input(shape=(None,None,3))    
-    input_ang = Input(shape=(None,None,1))    
+        f_img,f_ang_in,f_vert3d,f_faces,f_pose_input,f_vert_visible,f_bbox_train,f_poses,f_bboxes =\
+        to.add_integrated_img(img_sum[0][:,:,:3],face_target,target_pose,uv_target,bbox_ori,\
+                           b_img,b_ang_in,b_vert3d,b_faces,b_pose_input,b_vert_visible,b_bbox_train,b_poses,b_bboxes)
+        return f_img,f_ang_in,f_vert3d,f_faces,f_pose_input,\
+               f_vert_visible,f_bbox_train,f_poses,f_bboxes,f_gt_masks,img_ids
     
-    vert_xyz = Input(shape=(None,3))
-    faces = Input(shape=(None,3))
-    
-    vert_visible = Input(shape=(None,1))
-    bbox_train= Input(shape=(4,)) #bbox of training image
-    pose_input = Input(shape=(4,4))
-    
-    poses= Input(shape=(None,4,4))
-    bboxes = Input(shape=(None,4)) #normalized bbox of the rendering target
-    gt_render = Input(shape=(None,None,3))    
-    gt_real_fake=Input(shape=(1,))
-    
-    feed_uv = map_vert_to_uv(cam_K)
-
-    densenet=DenseNet121(include_top=False,weights='imagenet',input_shape=(None,None,3))
-    backbone = Model(inputs=densenet.input, 
-                     outputs=[densenet.get_layer('conv1/relu').output,
-                              densenet.get_layer('pool2_conv').output,
-                              densenet.get_layer('pool3_conv').output,
-                              densenet.get_layer('pool4_conv').output])
-
-    f1,f2,f3,f4=backbone(input_img) #size of f4 = input_dim/16
-    f1_e = BatchNormalization(axis=3)(f1)
-    f1_e = Activation('relu')(f1_e)
-    f1_e = Conv2D(4, (3, 3), name='conv1_reduce2',padding='same')(f1_e)
-    f1_e = BatchNormalization(axis=3)(f1_e)
-    f1_e = Activation('relu')(f1_e) #was tanh ' 21.Jan
-    
-    f2_e = BatchNormalization(axis=3)(f2)
-    f2_e = Activation('relu')(f2_e)
-    f2_e = Conv2D(3, (3, 3), name='conv2_reduce2',padding='same')(f2_e)
-    f2_e = BatchNormalization(axis=3)(f2_e)
-    f2_e = Activation('relu')(f2_e)
-
-    f3_e = BatchNormalization(axis=3)(f3)
-    f3_e = Activation('relu')(f3_e)
-    f3_e = Conv2D(3, (3, 3), name='conv3_reduce2',padding='same')(f3_e)
-    f3_e = BatchNormalization(axis=3)(f3_e)
-    f3_e = Activation('relu')(f3_e)
-
-    f4_e = BatchNormalization(axis=3)(f4)
-    f4_e = Activation('relu')(f4_e)
-    f4_e = Conv2D(3, (3, 3), name='conv4_reduce2',padding='same')(f4_e)
-    f4_e = BatchNormalization(axis=3)(f4_e)
-    f4_e = Activation('relu')(f4_e)
-    
-    f1_ch =resize_uv_mask()([f1_e,input_img]) #4
-    f2_ch =resize_uv_mask()([f2_e,input_img]) #3
-    f3_ch =resize_uv_mask()([f3_e,input_img]) #3
-    f4_ch =resize_uv_mask()([f4_e,input_img]) #3
-    texture_feature = Concatenate()([input_img,input_ang,f1_ch,f2_ch,f3_ch,f4_ch]) 
-    #3 + 1 + 4 + 3 + 3+ 3
-    ch_dim = 3 + 1 + 4 + 3 + 3+ 3 #19
-    
-    vert_uv = feed_uv([vert_xyz,pose_input,vert_visible,bbox_train])
-    
-    render_featuremap = Render_and_integrate(ch_dim, ch_int=16,
-                        render_im_h=render_im_h,render_im_w=render_im_w,cam_K=cam_K,
-                        target_im_w=target_im_w,target_im_h=target_im_h)
-    int_image_module = integrated_img(ch_dim)
-    
-    rendered_mask,rendered_feat,rendered_raw,mask_0=\
-        render_featuremap([vert_xyz,vert_uv,faces,texture_feature,poses,bboxes])
-    compare_featues = int_image_module(rendered_feat)    
+    def iteration_pose_paper(self,f_img,f_ang_in,f_vert3d,f_faces,f_pose_input,\
+                       f_vert_visible,f_bbox_train,f_poses,f_bboxes,f_gt_masks,img_ids,
+                       max_iter,update_rate=1E-4):
+        '''
+        Original refinement code used for expriments in the paper
+        '''
+        update_rate = -update_rate
+        prev_loss=-1     
+        init_loss=-1
+        actual_iter=0            
+        while actual_iter<max_iter:    
+            actual_iter+=1
+            grad = self.iterate([f_img,f_ang_in,f_vert3d,f_faces,f_pose_input,f_vert_visible,f_bbox_train,
+                            f_poses,f_bboxes])
+            dgrad = grad[0][0]
+            loss = grad[1][0]            
+            if(np.abs(loss-prev_loss)<1E-6):
+                break
+            if(prev_loss!=-1 and prev_loss<loss):
+                #if loss increased with the updates: recover and update with a smaller rate
+                update_rate*=0.9 #decay update rate and recover old poses
+                f_pose_input = np.copy(prev_pose_input)
+                dgrad = np.copy(prev_dgrad)
+            else:
+                if(prev_loss==-1):init_loss=loss                    
+                prev_loss=loss
+                prev_pose_input = np.copy(f_pose_input)
+                prev_dgrad = dgrad            
+                update_rate*=0.99 #decay update rate               
+            for fig_id in range(1,f_img.shape[0]):
+                rx,ry,rz = tf3d.euler.mat2euler(dgrad[fig_id][:3,:3])
+                dx,dy,dz =np.maximum(np.minimum(0.005,update_rate* dgrad[fig_id][:3,3]),-0.005)
+                tf_adj = np.eye(4)
+                tf_adj[:3,:3]=tf3d.euler.euler2mat(update_rate*rx,update_rate*ry,update_rate*rz)
+                tf_adj[:3,3]=[dx,dy,dz]            
+                f_pose_input[fig_id]=np.matmul(tf_adj,f_pose_input[fig_id])              
+        return img_ids,f_pose_input[1:],loss,init_loss
+        
     
     
+    def render_a_pose(self,target_pose,**kwargs):
+        #Sample source images for the target pose, and get an initial rendering
+        f_img,f_ang_in,f_vert3d,f_faces,f_pose_input_so3,\
+        f_vert_visible,f_bbox_train,f_poses,f_bboxes,f_gt_masks,img_ids=\
+        self.get_batches(-1,target_pose)   
 
-    l_score = TimeDistributed( Conv2D(32, (3, 3), name='score_conv1',padding='same',activation='relu'))(compare_featues) 
-    l_score = TimeDistributed( Conv2D(16, (3, 3), name='score_conv2',padding='same',activation='relu'))(l_score) 
-    l_score = TimeDistributed( Conv2D(8, (3, 3), name='score_conv3',padding='same',activation='relu'))(l_score) 
-    l_score = TimeDistributed( Conv2D(1, (3, 3), name='score_conv5',padding='same')) (l_score)  #PosexBatchxHxWx1
-    l_scored_mask = Lambda(lambda x:tf.keras.activations.softmax(x,axis=1))(l_score)   
-    selected_cands = Lambda(lambda x:tf.reduce_sum(x[0]*x[1],axis=1))([rendered_feat,l_scored_mask]) #01.24 #posexHxWx3
+        #Local pose refinement for the target pose -> b_pose_input 
+        img_ids,pose_new,loss,init_loss = self.iteration_pose_paper(f_img,f_ang_in,f_vert3d,f_faces,f_pose_input_so3,\
+                                     f_vert_visible,f_bbox_train,f_poses,f_bboxes,f_gt_masks,img_ids,
+                                     **kwargs)         
+        #Rendering the final image with the updated pose
+        img_recont_norm,int_error,mask_output,proj_output,score_output,feature_in,uv_projection\
+        = self.render_gan.predict([f_img[1:],f_ang_in[1:],f_vert3d[1:],f_faces[1:],
+                                  pose_new,f_vert_visible[1:],f_bbox_train[1:],
+                                  f_poses[1:],f_bboxes[1:]])              
+        img_sum = np.sum(score_output*proj_output,axis=0)
+        result_img = tio.get_original_image(np.copy(img_sum[0,:,:,:3]))#normalized img to real img
+        return result_img
     
-    #For tuning and intermediate outputs for alternative training process
-    mask_output = Lambda(lambda x:tf.transpose(x,[1,0,2,3,4]))(rendered_mask) 
-    proj_output = Lambda(lambda x:tf.transpose(x,[1,0,2,3,4]))(rendered_feat)     
-    score_output = Lambda(lambda x:tf.transpose(x,[1,0,2,3,4]))(l_scored_mask)     
-    int_error = inter_projection_error()([mask_output,proj_output])    
-
-    input_int_map = Input(shape=(256,256,ch_dim))#posexhxwxch_dim
-    mask_int = Input(shape=(256,256,1)) #posexhxwx1
-
-    decode_net = wdsr.wdsr_b(scale=2,
-                            num_filters=32,
-                            num_res_blocks=6, #8
-                            res_block_expansion = 4,
-                            input_ch=ch_dim) #ch_dim-01.23
-
-    img_recont = decode_net(selected_cands) #pose x H x W x ch_dim (or 3?)
-    img_recont_masked = Lambda(lambda x :x[0]*x[1])([mask_0,img_recont])
-    img_recont_norm = preprocess_img_layer()(img_recont_masked)
-    
-    img_recont_ext =  decode_net(input_int_map)
-    img_recont_masked_ext = Lambda(lambda x :x[0]*x[1])([mask_int,img_recont_ext])
-    img_recont_norm_ext = preprocess_img_layer()(img_recont_masked_ext)
-
-
-    disc = DCGAN_discriminator()
-    disc_out = disc(img_recont_norm) #batchx1,    
-    disc_out_e = disc(img_recont_norm_ext) #batchx1,    
-    
-    f1_i,f2_i,f3_i,f4_i=backbone(gt_render) #preprocessed, batch x H x W x 3 #batch>pose
-    f1_r,f2_r,f3_r,f4_r=backbone(img_recont_norm) #-1~1 (also okay) 
-    f1_e,f2_e,f3_e,f4_e=backbone(img_recont_norm_ext) #-1~1 (also okay) 
-
-    mask_1= resize_uv_mask(mask=True)([mask_0,f1_i]) #pose x H1 x W1 x 1 
-    mask_2= resize_uv_mask(mask=True)([mask_0,f2_i]) #pose x H2 x W2 x 1 
-    
-    mask_1e= resize_uv_mask(mask=True)([mask_int,f1_e]) #pose x H1 x W1 x 1 
-    mask_2e= resize_uv_mask(mask=True)([mask_int,f2_e]) #pose x H2 x W2 x 1 
-    
-
-    sml_loss = smooth_label_loss2()([l_scored_mask,rendered_mask,selected_cands])
-    p_loss = perceptual_loss()([f1_i,f2_i,f1_r,f2_r,mask_1,mask_2])        
-    g_loss = gan_loss()([disc_out,gt_real_fake])
-    r_loss = recont_loss()([mask_0,img_recont_norm,gt_render])
-
-    p_loss_e = perceptual_loss()([f1_i,f2_i,f1_e,f2_e,mask_1e,mask_2e])        
-    g_loss_e = gan_loss()([disc_out_e,gt_real_fake])
-    r_loss_e = recont_loss()([mask_int,img_recont_norm_ext,gt_render])
-    
-    decoder_train = Model(inputs=[input_int_map,mask_int,gt_render,gt_real_fake],
-                          outputs=[r_loss_e,p_loss_e,g_loss_e])
-    
-    decoder_pred = Model(inputs=[input_int_map],
-                          outputs=[img_recont_ext])
-
-    Tuning_pose=Model(inputs=[input_img,input_ang,vert_xyz,faces,
-                              pose_input,vert_visible,bbox_train,poses,bboxes],
-                      outputs=[int_error,mask_output,proj_output,score_output])
-    
-    #r_loss,p_loss,sml_loss,pose_loss,g_loss
-    gan_train =  Model(inputs=[input_img,input_ang, #img info
-                               vert_xyz,faces, #model info
-                               pose_input,vert_visible,bbox_train, #input pose
-                               poses,bboxes, #target img info
-                               gt_render,gt_real_fake], #gts
-                        outputs=[r_loss,p_loss,sml_loss,g_loss])
-
-    train_model = Model(inputs=[input_img,input_ang, #img info
-                               vert_xyz,faces, #model info
-                               pose_input,vert_visible,bbox_train, #input pose
-                               poses,bboxes, #target img info
-                               gt_render],
-                        outputs=[r_loss,p_loss,sml_loss])
-    
-    l_score_output = Lambda(lambda x:tf.transpose(x,[1,0,2,3,4]),name='score_pred')(l_scored_mask) 
-    img_recont_batch = Lambda(lambda x:tf.tile(x[0],[tf.shape(x[1])[0],1,1,1]),name='recont_pred')([img_recont,input_img])
-
-    render_test = Model(inputs=[input_img,input_ang, #img info
-                               vert_xyz,faces, #model info
-                               pose_input,vert_visible,bbox_train, #input pose
-                               poses,bboxes],
-                        outputs=[compare_featues,l_score_output,rendered_raw]) #img_recont_norm
-    
-    img_recont_norm_batch = Lambda(lambda x:tf.tile(x[0],[tf.shape(x[1])[0],1,1,1]))([img_recont_norm,input_img])
-    render_gan = Model(inputs=[input_img,input_ang, #img info
-                               vert_xyz,faces, #model info
-                               pose_input,vert_visible,bbox_train, #input pose
-                               poses,bboxes],
-                        outputs=[img_recont_norm_batch,int_error,mask_output,proj_output,score_output])    
-    #first after the rendering
-    return train_model,backbone,render_test,\
-           disc, gan_train,render_gan,Tuning_pose,decoder_train,decoder_pred
-
-
-def simple_render(img_h,img_w,cam_K):        
-    vert_xyz = Input(shape=(None,3))
-    faces = Input(shape=(None,3))    
-    poses= Input(shape=(4,4))
-    rendered = neural_rendering_gbuffer(img_h=img_h, img_w=img_w, cam_K=cam_K)\
-               ([vert_xyz,faces,poses])
-    return Model(inputs=[vert_xyz,faces,poses],outputs=[rendered])
-
-

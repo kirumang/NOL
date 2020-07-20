@@ -1,6 +1,8 @@
 '''
 This code is modified from https://github.com/krasserm/super-resolution
 
+Copyright [2018] [Martin Krasser, https://github.com/krasserm/super-resolution]
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -13,11 +15,12 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 '''
+
 import tensorflow as tf
 
-from keras import backend as K
-from keras.layers import Add, Conv2D, Input, Lambda, Activation,Layer
-from keras.models import Model
+from tensorflow.keras import backend as K
+from tensorflow.keras.layers import Add, Conv2D, Input, Lambda, Activation,Layer
+from tensorflow.keras.models import Model
 
 from .common import SubpixelConv2D, Normalization, Denormalization
 

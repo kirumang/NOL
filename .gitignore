@@ -1,0 +1,12 @@
+
+NOL_model/__pycache__/
+
+\.ipynb_checkpoints/
+
+results/
+
+sample_data/ho3d/
+
+sample_data/smot/
+
+NOL_tools/__pycache__/
