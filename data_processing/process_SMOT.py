@@ -35,7 +35,7 @@ if(len(sys.argv)<3):
 smot_dir=sys.argv[1]    
 t_label=sys.argv[2]
 
-icp=True
+icp=1
 if(len(sys.argv)==4):
     icp=int(sys.argv[3])
    
@@ -265,7 +265,8 @@ for s_id in selected_frames:
     masks.append(mask_crop)  
     bboxes.append(bbox_new)
     
-test_fn = "./sample_data/"+t_label+".hdf5"
+test_fn = "./sample_data/smot/"+t_label+".hdf5"
+if not(os.path.exists("./sample_data/smot/")):os.makedirs("./sample_data/smot/")    
 train_data = h5py.File(test_fn, "w")
 train_data.create_dataset("vertices_3d",data=vertices)
 train_data.create_dataset("faces",data=np.array(faces))
