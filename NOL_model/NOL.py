@@ -37,7 +37,7 @@ from skimage.transform import resize
 from skimage.morphology import binary_dilation
 import h5py
 import json
-
+from sklearn.neighbors import NearestNeighbors
 
 class NOL:
     def __init__(self,src_fn,im_h,im_w,cam_K,n_source=6):       
@@ -57,27 +57,25 @@ class NOL:
         iterate = keras.backend.function(Tuning_pose.inputs, [gradient,Tuning_pose.outputs[0],Tuning_pose.output[3]])
 
         simple_renderer = NOLnet.simple_render(img_h=im_h,img_w=im_w,cam_K=cam_K) 
-
-
         self.iterate = iterate
         self.render_gan = render_gan
         self.simple_renderer = simple_renderer      
         self.im_height=im_h
         self.im_width=im_w
         self.cam_K=cam_K          
-        self.t_images,self.t_vert,self.t_faces,self.t_poses,self.t_bboxes,\
-        self.t_bboxes_ori,self.gt_masks_full,self.gt_masks=self.load_data(src_fn)
-        
-        self.n_src = self.t_images.shape[0]        
-        
-        self.t_vert_vis=np.zeros((1000),bool)        
-        
-        self.t_face_angles=[]
-        self.face_angles_full=[]        
-        self.face_o3d = []        
+        self.t_images=None
+        self.t_vert=None
+        self.t_faces=None
+        self.t_poses=None
+        self.t_bboxes=None
+        self.t_bboxes_ori=None
+        self.gt_masks_full=None
+        self.gt_masks=None
+        self.t_vert_vis=self.t_vert_vis=np.zeros((1000),bool) 
+        self.t_face_angles=[]                        
         self.n_source = n_source
-        print("Compute visible vertices in each poses...")
-        self.update_vert_vis()
+        self.n_src=-1
+        self.load_data(src_fn)    
     
     def get_edge_imgage(self,img_source,render_xyz,c_box,th=0.1):
         render_xyz = render_xyz[c_box[0]:c_box[2],c_box[1]:c_box[3]]
@@ -89,8 +87,9 @@ class NOL:
         edge_mask = binary_dilation(edge_mask)>0
         img_source[edge_mask>0]=[0,1,1]
         return img_source
+        return img_source
     def display_inputs(self):
-        f,ax = plt.subplots(1,self.n_src,figsize=(10,20))
+        f,ax = plt.subplots(1,self.n_src,figsize=(20,30))
         for fig_id in range(0,self.n_src):      
             simple_xyz = self.simple_renderer.predict([np.array([self.t_vert]),np.array([self.t_faces]),self.t_poses[fig_id:fig_id+1]])
             c_box = self.t_bboxes_ori[fig_id]
@@ -99,6 +98,7 @@ class NOL:
             if not(c_box[2]-c_box[0]<10 or c_box[3]-c_box[1]<10):
                 img_source = self.get_edge_imgage(img_source,render_xyz,c_box,th=0.1)
             ax[fig_id].imshow(img_source)
+            ax[fig_id].axis('off')
     def get_updates(self,dx, x,v,iterations,momentum=0.9,lr=0.001,decay=0.99):
         '''
         grad:gradient
@@ -111,45 +111,53 @@ class NOL:
         v = momentum*v - lr*dx
         x += v
         return x,v
+    
     def load_data(self,fn):        
         train_data = h5py.File(fn, "r")
-        t_vert = np.array(train_data["vertices_3d"])
-        t_faces =  np.array(train_data['faces'])
+        self.t_vert = np.array(train_data["vertices_3d"])
+        self.t_faces =  np.array(train_data['faces'])
         
-        t_images =  np.array(train_data['images'])
-        t_poses = np.array(train_data['poses'])
-        t_masks = np.array(train_data['masks'])        
-        t_bboxes = np.array(train_data['bboxes']).astype(np.float32)
-        t_bboxes_ori = np.copy(t_bboxes)
-        t_bboxes[:,0]=t_bboxes[:,0]/(self.im_height-1)
-        t_bboxes[:,1]=t_bboxes[:,1]/(self.im_width-1)
-        t_bboxes[:,2]=(t_bboxes[:,2]-1)/(self.im_height-1)
-        t_bboxes[:,3]=(t_bboxes[:,3]-1)/(self.im_width-1)
-        t_bboxes = np.clip(t_bboxes,0,1)        
-
+        self.t_images =  np.array(train_data['images'])
+        self.t_images[:,:2,:2]=0 #a trick to ignore invalid uv values
+        if(np.max(self.t_images>2) or self.t_images.dtype==np.uint8):
+            self.t_images = self.t_images.astype(np.float32)/255
+        
+        self.t_poses = np.array(train_data['poses'])        
+        self.t_bboxes = np.array(train_data['bboxes']).astype(np.float32)
+        self.t_bboxes_ori = np.copy(self.t_bboxes)
+        self.t_bboxes[:,0]=self.t_bboxes[:,0]/(self.im_height-1)
+        self.t_bboxes[:,1]=self.t_bboxes[:,1]/(self.im_width-1)
+        self.t_bboxes[:,2]=(self.t_bboxes[:,2]-1)/(self.im_height-1)
+        self.t_bboxes[:,3]=(self.t_bboxes[:,3]-1)/(self.im_width-1)
+        self.t_bboxes = np.clip(self.t_bboxes,0,1)        
+        self.t_bboxes_ori = self.t_bboxes_ori.astype(np.int)
+        self.n_src = self.t_images.shape[0]  
         gt_masks_full=[]
         gt_masks=[]
-        t_bboxes_ori = t_bboxes_ori.astype(np.int)
-        for im_id in range(t_images.shape[0]):
-            mask = resize(t_masks[im_id].astype(np.float32),(t_bboxes_ori[im_id,2]-t_bboxes_ori[im_id,0],t_bboxes_ori[im_id,3]-t_bboxes_ori[im_id,1]))
-            mask[mask>=0.5] = 1
-            mask[mask<0.5] = 0
-            full_mask = np.zeros((480,640,1))
-            crop_mask = np.zeros((256,256,1))
-            crop_mask[:,:,0:1]= t_masks[im_id]>0
-            full_mask[t_bboxes_ori[im_id,0]:t_bboxes_ori[im_id,2],t_bboxes_ori[im_id,1]:t_bboxes_ori[im_id,3],0:1]=mask
-            gt_masks_full.append(full_mask)
-            gt_masks.append(crop_mask)    
-        gt_masks_full = np.array(gt_masks_full)
-        gt_masks = np.array(gt_masks)                
-        train_data.close()
-        return t_images,t_vert,t_faces,t_poses,t_bboxes,\
-               t_bboxes_ori,gt_masks_full,gt_masks
+        use_mask=False
+        if 'masks' in train_data:
+            t_masks = np.array(train_data['masks'])        
+            for im_id in range(self.t_images.shape[0]):
+                    mask = resize(t_masks[im_id].astype(np.float32),(self.t_bboxes_ori[im_id,2]-self.t_bboxes_ori[im_id,0],self.t_bboxes_ori[im_id,3]-self.t_bboxes_ori[im_id,1]))
+                    mask[mask>=0.5] = 1
+                    mask[mask<0.5] = 0
+                    full_mask = np.zeros((480,640,1))
+                    crop_mask = np.zeros((256,256,1))
+                    crop_mask[:,:,0:1]= t_masks[im_id]>0
+                    full_mask[self.t_bboxes_ori[im_id,0]:self.t_bboxes_ori[im_id,2],self.t_bboxes_ori[im_id,1]:self.t_bboxes_ori[im_id,3],0:1]=mask
+                    gt_masks_full.append(full_mask)
+                    gt_masks.append(crop_mask)    
+            self.gt_masks_full = np.array(gt_masks_full)
+            self.gt_masks = np.array(gt_masks)  
+            use_mask=True
+        self.update_vert_vis(use_mask)            
+        train_data.close()        
+        print("Completed loading data")        
         
-    def update_vert_vis(self):
+    def update_vert_vis(self,use_mask=True):
         c_vert = np.array(self.t_vert)
         face_obj = np.array(self.t_faces)
-        #t_face_angles
+        
         face_angles=[]
         face_angles_full=[]
         vert_visb=[]
@@ -177,39 +185,39 @@ class NOL:
             face_angle2[mask_face] = np.sum(camera_angle[mask_face]*normal2[mask_face],axis=1)\
                                             /valid_xyz[mask_face]/valid_normal[mask_face]
 
+            valid_indice = np.zeros((mesh_vert.shape[0]),bool)           
+            
+            xyz=xyz[mask]
+            nn = NearestNeighbors(n_neighbors=50).fit(mesh_vert)                    
+            dists,indices = nn.kneighbors(xyz)
+            vert_mask = np.zeros((mesh_vert.shape[0]),np.uint8)
             valid_indice = np.zeros((mesh_vert.shape[0]),bool)
-            u_temp  =(self.cam_K[0,0]*tf_vert[0]/tf_vert[2] + self.cam_K[0,2]).astype(np.int)
-            v_temp  =(self.cam_K[1,1]*tf_vert[1]/tf_vert[2] + self.cam_K[1,2]).astype(np.int)
-            valid_idx = np.logical_and(u_temp>=0, u_temp+1<self.im_width)
-            valid_idx = np.logical_and(np.logical_and(v_temp>=0, v_temp+1<self.im_height),valid_idx)    
+            for pt_idx in range(xyz.shape[0]):
+                valid_ver = indices[pt_idx,dists[pt_idx,:]<0.01]                
+                vert_mask[valid_ver]=1            
+            visible_face_id = (vert_mask[face_obj[:,0]]+vert_mask[face_obj[:,1]]+vert_mask[face_obj[:,2]])>0                    
+            valid_normal_face_id = mesh_normal[:,2]<=0
+            valid_faces =face_obj[np.logical_and(visible_face_id,valid_normal_face_id)]
+            valid_indice[valid_faces[:,0]]=1
+            valid_indice[valid_faces[:,1]]=1
+            valid_indice[valid_faces[:,2]]=1 
             
-            valid_indice[valid_idx] = np.abs(depth_r[v_temp[valid_idx],u_temp[valid_idx]]-tf_vert[2,valid_idx])<0.01
-            valid_indice[valid_idx] = np.abs(depth_r[v_temp[valid_idx]+1,u_temp[valid_idx]]-tf_vert[2,valid_idx])<0.01
-            valid_indice[valid_idx] = np.abs(depth_r[v_temp[valid_idx],u_temp[valid_idx]+1]-tf_vert[2,valid_idx])<0.01
-            valid_indice[valid_idx] = np.abs(depth_r[v_temp[valid_idx]+1,u_temp[valid_idx]+1]-tf_vert[2,valid_idx])<0.01
+            if(use_mask):
+                #use mask if objects are partially occluded by other objects
+                u_temp  =(self.cam_K[0,0]*tf_vert[0]/tf_vert[2] + self.cam_K[0,2]).astype(np.int)
+                v_temp  =(self.cam_K[1,1]*tf_vert[1]/tf_vert[2] + self.cam_K[1,2]).astype(np.int)
+                valid_idx = np.logical_and(u_temp>=0, u_temp+1<self.im_width)
+                valid_idx = np.logical_and(np.logical_and(v_temp>=0, v_temp+1<self.im_height),valid_idx)    
+
+                valid_uvs = np.zeros_like(valid_indice)  
+                valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx],u_temp[valid_idx],0])
+                valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx]+1,u_temp[valid_idx],0])
+                valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx],u_temp[valid_idx]+1,0])
+                valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx]+1,u_temp[valid_idx]+1,0])
+                valid_indice[valid_idx] = np.logical_and(valid_indice[valid_idx],valid_uvs[valid_idx])   
+
+
             
-            valid_uvs = np.zeros_like(valid_indice)
-            
-            #valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],1 - self.gt_masks_full[im_id][v_temp[valid_idx],u_temp[valid_idx],1])
-            #valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],1 - self.gt_masks_full[im_id][v_temp[valid_idx]+1,u_temp[valid_idx],1])
-            #valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],1 - self.gt_masks_full[im_id][v_temp[valid_idx],u_temp[valid_idx]+1,1])
-            #valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],1 - self.gt_masks_full[im_id][v_temp[valid_idx]+1,u_temp[valid_idx]+1,1])   
-            
-            
-            valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx],u_temp[valid_idx],0])
-            valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx]+1,u_temp[valid_idx],0])
-            valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx],u_temp[valid_idx]+1,0])
-            valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],self.gt_masks_full[im_id][v_temp[valid_idx]+1,u_temp[valid_idx]+1,0])
-            valid_indice[valid_idx] = np.logical_and(valid_indice[valid_idx],valid_uvs[valid_idx])   
-            
-            #remove invalid faces
-            visible_face_id = (valid_indice[face_obj[:,0]]+valid_indice[face_obj[:,1]]+valid_indice[face_obj[:,2]])>0                            
-            invalid_normal_face_id = face_obj[np.logical_and(mesh_normal[:,2]>0,
-                                                             np.invert(visible_face_id))]
-            valid_indice[invalid_normal_face_id[:,0]]=0
-            valid_indice[invalid_normal_face_id[:,1]]=0
-            valid_indice[invalid_normal_face_id[:,2]]=0            
-        
             vert_visb.append(valid_indice)
             face_angles_full.append(face_angle2)
             face_angle_crop = resize(face_angle2[bbox_new[0]:bbox_new[2],bbox_new[1]:bbox_new[3]],(256,256))
@@ -305,9 +313,8 @@ class NOL:
                 f_pose_input[fig_id]=np.matmul(tf_adj,f_pose_input[fig_id])              
         return img_ids,f_pose_input[1:],loss,init_loss
         
-    
-    
-    def render_a_pose(self,target_pose,**kwargs):
+        
+    def render_a_pose(self,target_pose,back_color=[0,0,0],**kwargs):
         #Sample source images for the target pose, and get an initial rendering
         f_img,f_ang_in,f_vert3d,f_faces,f_pose_input_so3,\
         f_vert_visible,f_bbox_train,f_poses,f_bboxes,f_gt_masks,img_ids=\
@@ -323,6 +330,13 @@ class NOL:
                                   pose_new,f_vert_visible[1:],f_bbox_train[1:],
                                   f_poses[1:],f_bboxes[1:]])              
         img_sum = np.sum(score_output*proj_output,axis=0)
-        result_img = tio.get_original_image(np.copy(img_sum[0,:,:,:3]))#normalized img to real img
-        return result_img
-    
+        img = tio.get_original_image(np.copy(img_sum[0,:,:,:3]))
+        if(np.sum(np.array(back_color))>0):
+            simple_xyz = self.simple_renderer.predict([np.array([self.t_vert]),
+                                            np.array([self.t_faces]),
+                                            np.array([target_pose])])
+            bbox=f_bbox_train[0].astype(int)
+            mask = simple_xyz[0,:,:,3]>0
+            img[np.invert(mask[bbox[0]:bbox[2],bbox[1]:bbox[3]])]=back_color
+            img[np.invert(f_gt_masks[0,:,:,0]>0)]=back_color
+        return img

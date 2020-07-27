@@ -412,3 +412,68 @@ def save_json(path, content):
         f.write('\n')
     f.write('}')   
     
+def get_face_angles(depth_r,cam_K,im_height,im_width):
+    mask_effect = depth_r>0
+    xyz = getXYZ(depth_r,cam_K[0,0],cam_K[1,1],cam_K[0,2],cam_K[1,2])
+    normal2,_ = get_normal(depth_r,cam_K[0,0],cam_K[1,1],cam_K[0,2],cam_K[1,2])
+    normal2[np.invert(mask_effect)]=0
+    
+    camera_angle = np.copy(xyz)
+    face_angle2= np.zeros( (im_height,im_width))
+    valid_xyz = np.linalg.norm(camera_angle,axis=2)
+    valid_normal = np.linalg.norm(normal2,axis=2)
+    mask_face = np.logical_and(np.logical_and(depth_r>0,valid_xyz>0),valid_normal>0)
+    
+    face_angle2[mask_face] = np.sum(camera_angle[mask_face]*normal2[mask_face],axis=1)\
+                                    /valid_xyz[mask_face]/valid_normal[mask_face]
+    return face_angle2   
+
+def get_valid_vertices(c_vert,face_obj,depth_r,pose,cam_K,im_width,im_height,mask=None):       
+    '''
+    Compute visible vertices in the pose (using a rendered detph image in the pose without occlusion)
+    If mask is given, vertices that do not belong to the mask are regarded as invisible vetices. 
+    '''
+    mask_ren = depth_r>0
+    vert_vis = np.ones((c_vert.shape[0]))    
+    tf_vert = (np.matmul(pose[:3,:3],c_vert.T)+pose[:3,3:4])
+    mesh_vert = np.copy(tf_vert.T)    
+    mesh_normal = compute_face_normals(mesh_vert,face_obj)        
+    xyz = getXYZ(depth_r,cam_K[0,0],cam_K[1,1],cam_K[0,2],cam_K[1,2])
+    
+    xyz=xyz[mask_ren]
+    valid_indice = np.zeros((mesh_vert.shape[0]),bool)           
+    
+    nn = NearestNeighbors(n_neighbors=50).fit(mesh_vert)                    
+    dists,indices = nn.kneighbors(xyz)
+    vert_mask = np.zeros((mesh_vert.shape[0]),np.uint8)
+    valid_indice = np.zeros((mesh_vert.shape[0]),bool)
+    for pt_idx in range(xyz.shape[0]):
+        valid_ver = indices[pt_idx,dists[pt_idx,:]<0.01]                
+        vert_mask[valid_ver]=1            
+    visible_face_id = (vert_mask[face_obj[:,0]]+vert_mask[face_obj[:,1]]+vert_mask[face_obj[:,2]])>0                    
+    valid_normal_face_id = mesh_normal[:,2]<=0
+    valid_faces =face_obj[np.logical_and(visible_face_id,valid_normal_face_id)]
+    valid_indice[valid_faces[:,0]]=1
+    valid_indice[valid_faces[:,1]]=1
+    valid_indice[valid_faces[:,2]]=1 
+
+    if(mask is not None):
+        #use mask if objects are partially occluded by other objects
+        u_temp  =(cam_K[0,0]*tf_vert[0]/tf_vert[2] + cam_K[0,2]).astype(np.int)
+        v_temp  =(cam_K[1,1]*tf_vert[1]/tf_vert[2] + cam_K[1,2]).astype(np.int)
+        valid_idx = np.logical_and(u_temp>=0, u_temp+1<im_width)
+        valid_idx = np.logical_and(np.logical_and(v_temp>=0, v_temp+1<im_height),valid_idx)    
+
+        valid_uvs = np.zeros_like(valid_indice)  
+        valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],
+                                             mask[v_temp[valid_idx],u_temp[valid_idx]])
+        valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],
+                                             mask[v_temp[valid_idx]+1,u_temp[valid_idx]])
+        valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],
+                                             mask[v_temp[valid_idx],u_temp[valid_idx]+1])
+        valid_uvs[valid_idx] = np.logical_or(valid_uvs[valid_idx],
+                                             mask[v_temp[valid_idx]+1,u_temp[valid_idx]+1])
+        valid_indice[valid_idx] = np.logical_and(valid_indice[valid_idx],valid_uvs[valid_idx])  
+
+    return valid_indice
+
