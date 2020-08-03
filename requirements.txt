@@ -1,0 +1,8 @@
+tensorflow==2.1.0
+opencv-python==3.4.2.17
+opencv-contrib-python==3.4.2.17
+transforms3d==0.3.1
+open3d==0.9.0.0
+scikit-image
+scikit-learn
+matplotlib

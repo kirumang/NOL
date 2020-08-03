@@ -12,8 +12,6 @@ from sklearn.neighbors import NearestNeighbors
 import open3d as o3d
 
 import transforms3d as tf3d
-import PIL.Image
-import pyamg
 import copy
 import math
 from tensorflow.keras.applications.densenet import preprocess_input

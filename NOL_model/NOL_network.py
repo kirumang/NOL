@@ -20,9 +20,6 @@ from tensorflow.keras.callbacks import TensorBoard, ModelCheckpoint
 from tensorflow.keras.layers import Add
 
 
-import tensorflow_graphics as tfg
-from tensorflow_graphics.geometry import transformation as tf_tf
-
 import math
 from tensorflow.keras.applications.densenet import DenseNet121
 ROOT_DIR = os.path.abspath("../")

@@ -16,20 +16,16 @@ disable_eager_execution()
 
 from tensorflow import keras
 from tensorflow.keras import backend as K
-import tensorflow_graphics as tfg
 from tensorflow.keras.applications.densenet import preprocess_input
 
 
 from NOL_model import NOL_network as NOLnet
 from NOL_model.NOL_network import simple_mask_error,iou_error,so3_to_mat
 import NOL_tools.operations as to
+import NOL_tools.train_io as tio
 #Rendering process 
 import subprocess
 import cv2
-import NOL_tools.train_io as tio
-from NOL_tools.train_io import data_generator
-
-
 
 import math
 from math import radians

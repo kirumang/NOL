@@ -8,7 +8,6 @@ import sys,os
 sys.path.append(os.path.abspath('.'))  # To find local version of the library
 sys.path.append(os.path.abspath('../'))  # To find local version of the library
 import cv2
-import yaml
 import numpy as np
 import open3d as o3d
 import copy
