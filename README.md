@@ -1,6 +1,8 @@
 # NOL
 An official implementation of the paper, Neural Object Learning for 6D Pose Estimation Using a Few Cluttered Images, ECCV 2020 Spotlight, https://arxiv.org/abs/2005.03717
 
+![NOL](./doc/NOL_short.gif)
+
 ### Requirements:
 **The best way of running the code is using a nvidia-docker container**
 * Docker + Nvidia-docker (https://github.com/NVIDIA/nvidia-docker)
