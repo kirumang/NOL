@@ -1,4 +1,4 @@
-# NOL
+# Neural Object Learning for 6D Pose Estimation
 An official implementation of the paper, Neural Object Learning for 6D Pose Estimation Using a Few Cluttered Images, ECCV 2020 Spotlight, https://arxiv.org/abs/2005.03717
 
 ![NOL](./doc/NOL_short.gif)
