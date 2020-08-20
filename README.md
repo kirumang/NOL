@@ -41,10 +41,13 @@ python3 examples/NOL_rendering_one.py cfg_camera/camera_SMOT.json sample_data/ob
 ```
 
 The code is ready to run if you can see a rendered image in the folder ```./result/obj_01/```,
-with the following message
+with the following message.
 ```
 Generated: ./results/obj_01/0000.png
 ```
+The result image should look like this,
+
+![Sample image](./doc/0000.png)
 
 ---
 ### Render an object from uniformly sample view points in the upper-hemisphere
