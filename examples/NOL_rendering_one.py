@@ -41,7 +41,7 @@ im_height = camera_intrinsic['height']
 m_NOL = NOL.NOL(src_fn,im_h=im_height,im_w=im_width,cam_K=cam_K)
 
 
-update_rate=1E-5 #for LineMOD and SMOT
+update_rate=1E-4 #for LineMOD and SMOT
 pose_list = np.load("./sample_data/pose_target_lm.npy")
 total_ids = np.arange(np.arange(0,360,5).shape[0]*np.arange(0,90,5).shape[0])
 azi_ele = total_ids.reshape(72,18)
