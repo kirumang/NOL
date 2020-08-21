@@ -83,9 +83,9 @@ a data file (.hdf5) should be created to render a new object from source images
 - "faces": face indices (Fx3, numpy array)
 - "images": cropped patches of source images (Nx256x256x3, numpy array)
 - "bboxes" : bboxes, defined in the original images, where the patches are cropped from (Nx4, numpy array, [v1,h1,v2,h2]) 
--- e.g., if a patch of the object is cropped from (100,200) - (150,400)
--- images[0] = a resized image of the region (100,200) - (150,400)
--- bboxes[0] = [100,200,150,400]
+  - e.g., if a patch of the object is cropped from (100,200) - (150,400)
+  - images[0] = a resized image of the region (100,200) - (150,400)
+  - bboxes[0] = [100,200,150,400]
 - "poses" : object poses (transformation matrix) in the source images (Nx4x4, numpy array)
 
 2. Save the components to a hdf5 file
